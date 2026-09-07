@@ -35,6 +35,12 @@ local CONFIG = {
     SCAN_RANGE     = 12,   -- tiles to look for rocks
     HIGHLIGHT_RANGE = 16,  -- tiles to look for rockertunity markers
     MAX_FAILS      = 10,   -- passes with no rock found before stopping
+
+    --- Minutes before nudging the idle timer, so a long AFK session is not
+    --- logged out. The actual wait is randomised between 60% and 90% of this,
+    --- so it never fires on the same interval twice.
+    MAX_IDLE_TIME_MINUTES = 5,
+
     DEBUG          = false,
 }
 local EXTRA_ROCK_NAMES = {
@@ -56,13 +62,40 @@ local ORE_BOX_VARBITS = {
 ---
 --- Matched by NAME so it works whatever variant is worn, rather than pinning a
 --- single item id.
+--- Both wearable ids, from the game cache. 44548 is the tradeable amulet and
+--- 44550 the untradeable one you hold once it has been charged, which is what
+--- anyone actually using it wears; 44549 is the noted form and cannot be worn.
+--- They share the name "Grace of the elves", so the name cannot tell them
+--- apart, and an id is what actually answers the question -- a name lookup
+--- returned false for an amulet that was plainly equipped.
+local GRACE_IDS  = { 44550, 44548 }
 local GRACE_NAME = "Grace of the elves"
 
 local GRACE_BUFF = 51490
 local GRACE_MAX  = 500
 local GRACE_CHARGE_ACTION = { 0xffffffff, 0xae06, 6, 1464, 15, 2 }
-local PORTER_IDS  = { 29275, 29277, 29279, 29281, 29283, 29285, 51490 }
-local PORTER_NAME = "Sign of the porter"
+--- Every usable Sign of the porter id, from the game cache.
+---
+--- The old list held seven and missed five: 39493/39494/39495 are alternative
+--- IV/V/VI, 51487 a second VII, and 29282 is "Active Sign of the porter IV". A
+--- porter this list does not know reads as "no porters left", which stops the
+--- script with a pack full of them.
+---
+--- Noted forms (58301-58307) are left out deliberately: they sit in the pack
+--- but cannot charge anything, so counting them would be worse than missing
+--- them.
+local PORTER_IDS = {
+    29275, 29277, 29279, 29281, 29282, 29283, 29285,
+    39493, 39494, 39495, 51487, 51490,
+}
+
+--- Exact names, because nothing is called plain "Sign of the porter" -- every
+--- one is numbered I to VII, so the unnumbered lookup found nothing.
+local PORTER_NAMES = {
+    "Sign of the porter I", "Sign of the porter II", "Sign of the porter III",
+    "Sign of the porter IV", "Sign of the porter V", "Sign of the porter VI",
+    "Sign of the porter VII", "Active Sign of the porter IV",
+}
 
 --- Bank objects worth trying, by name.
 local BANK_NAMES = { "Bank chest", "Deposit box", "Bank booth", "Banker" }
@@ -81,6 +114,10 @@ local lastRockTile   = nil
 local commitUntilTick = -99
 local status         = "Starting"
 local dumpedGfx      = false
+--- When the idle timer was last nudged. Seeded NOW rather than left nil: the
+--- first idleCheck call does os.difftime against it, and difftime on nil is an
+--- error, not a zero.
+local afk            = os.time()
 
 --- The ore picked out of the catalogue, if CONFIG.ORE names one.
 local selectedOre    = nil
@@ -121,6 +158,29 @@ end
 
 local function playerIsIdle()
     return IDLE_ANIMS[API.ReadPlayerAnim()] == true
+end
+
+--- Nudges the client's idle timer so a long session is not logged out.
+---
+--- Local, like everything else here; as a global it would collide with any
+--- other script defining the same name.
+---
+--- The bounds are floored because math.random rejects a float with no exact
+--- integer representation. Whole minutes happen to come out exact, but a
+--- fractional setting does not: 0.7 and 3.3 both throw without this.
+local function idleCheck()
+    local seconds = (CONFIG.MAX_IDLE_TIME_MINUTES or 5) * 60
+    if seconds <= 0 then return end
+
+    local timeDiff = os.difftime(os.time(), afk)
+    local randomTime = math.random(math.floor(seconds * 0.6),
+                                   math.floor(seconds * 0.9))
+
+    if timeDiff > randomTime then
+        debugLog("nudging the idle timer after %ds", timeDiff)
+        pcall(API.PIdle2)
+        afk = os.time()
+    end
 end
 
 local function isMining()
@@ -333,30 +393,85 @@ local function mineRock(rock, why, commitTicks)
 end
 
 --- Whether the amulet is actually worn.
+--- Whether the amulet is actually worn.
+---
+--- Asks by ID first; the name is kept only as a long stop, because that is what
+--- was here before and it answered false for an amulet that was being worn.
 local function wearingGrace()
+    for _, id in ipairs(GRACE_IDS) do
+        local ok, has = pcall(function() return Equipment:Contains(id) end)
+        if ok and has == true then return true end
+    end
     local ok, has = pcall(function() return Equipment:Contains(GRACE_NAME) end)
     return ok and has == true
 end
 
 --- @return number|nil
+--- Charges left on the amulet, or nil if the buff cannot be read.
+---
+--- Buff id 51490, and .text carries the number -- 500 is a full amulet.
+---
+--- Deliberately does NOT test type(bar) == "table". These natives hand back
+--- sol2 userdata on some clients rather than a Lua table, and that test would
+--- throw away a perfectly good reading and report "unreadable" forever, which
+--- reads exactly like a flat amulet that never gets charged. Every other script
+--- in the repo indexes the result straight off, so field access is what is
+--- actually supported; the reads are wrapped instead.
+---
+--- .conv_text is tried after .text because the two are populated differently
+--- depending on whether the buff shows a timer or a count, and the working
+--- Arch-Glacor code reads counts out of .conv_text.
+---
+--- nil and 0 stay distinct: 0 means "charge it now", nil means "no information",
+--- and acting on no information is how a familiar-health check elsewhere turned
+--- -1 into an endless loop. An absent buff counts as 0 only because the caller
+--- has already confirmed the amulet is worn.
+--- @return number|nil
 local function graceCharges()
     local ok, bar = pcall(API.Buffbar_GetIDstatus, GRACE_BUFF, false)
-    if not ok or type(bar) ~= "table" then return nil end
+    if not ok or bar == nil then return nil end
 
-    local n = tonumber(bar.text)
+    -- readOk separates "the fields say the buff is gone" from "the fields could
+    -- not be read at all". Without it, an object that throws on every read fell
+    -- through to the not-found branch and reported 0 charges, which spends a
+    -- porter on a reading that never happened.
+    local readOk = false
+    local function field(name)
+        local got, value = pcall(function() return bar[name] end)
+        if got then readOk = true end
+        return got and value or nil
+    end
+
+    local n = tonumber(field("text")) or tonumber(field("conv_text"))
     if n then return n end
 
-    local found = bar.found == true or (tonumber(bar.id) or 0) > 0
+    local foundValue, idValue = field("found"), field("id")
+    if not readOk then return nil end
+
+    local found = foundValue == true or (tonumber(idValue) or 0) > 0
     return (not found) and 0 or nil
 end
 
 --- Porters in the pack.
+--- Porters in the pack.
+---
+--- Ids lead, for the same reason as the amulet. The names are tried afterwards
+--- so a tier the id list somehow misses is still seen, and only then does this
+--- answer zero -- because answering zero wrongly stops the script.
 local function porterCount()
-    local ok, n = pcall(function() return Inventory:InvItemcount_String(PORTER_NAME) end)
+    local ok, n = pcall(function() return Inventory:InvItemcounts(PORTER_IDS) end)
     if ok and type(n) == "number" and n > 0 then return n end
 
-    local ok2, found = pcall(function() return Inventory:InvItemFounds(PORTER_IDS) end)
-    return (ok2 and found == true) and 1 or 0
+    local okFound, found = pcall(function() return Inventory:InvItemFounds(PORTER_IDS) end)
+    if okFound and found == true then return 1 end
+
+    for _, name in ipairs(PORTER_NAMES) do
+        local okName, count = pcall(function()
+            return Inventory:InvItemcount_String(name)
+        end)
+        if okName and type(count) == "number" and count > 0 then return count end
+    end
+    return 0
 end
 
 --- Tops the amulet up when it runs low.
@@ -679,7 +794,7 @@ while running() do
             API.RandomSleep2(300, 100, 200)
         end
     end
-    
+    idleCheck()
     API.DoRandomEvents()
     API.RandomSleep2(50, 30, 60)
 end
